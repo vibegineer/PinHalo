@@ -306,3 +306,64 @@ sealed class SettingsForm : Form
         DialogResult = DialogResult.OK;
     }
 }
+
+// Процесс окна настроек: AlwaysOnTop.exe --settings [--hotkey-busy]. WinForms и GDI+ грузятся только здесь
+// и уходят вместе с процессом. Код выхода: 0 — сохранено, 1 — отмена. Основной процесс на это время снимает свой хоткей.
+static class SettingsApp
+{
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, int mod, int vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    const int TEST_HOTKEY_ID = 0xBFFF;
+
+    public static int Run(bool hotkeyBusy)
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) => Log.Info("Unhandled (settings): " + e.Exception);
+
+        var settings = Settings.Load();
+        Loc.Init(settings.Language);
+        Icon icon = SystemIcons.Application;
+        try
+        {
+            using (var st = typeof(SettingsApp).Assembly.GetManifestResourceStream("AlwaysOnTop.ico"))
+                if (st != null) icon = new Icon(st, SystemInformation.SmallIconSize);
+        }
+        catch (Exception ex) { Log.Info("Icon load failed: " + ex.Message); }
+
+        if (hotkeyBusy)
+            MessageBox.Show(Loc.T("Err.HotkeyRegister", Hotkey.Format(settings.Modifiers, settings.Key)), "Always on Top",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button1,
+                Loc.IsRtl ? MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign : (MessageBoxOptions)0);
+
+        // Несохранённое состояние окна: переживает пересоздание окна при смене языка
+        int mods = settings.Modifiers, key = settings.Key;
+        string lang = settings.Language;
+        Point? at = null;
+        while (true)
+        {
+            Loc.Init(lang); // окно показывается на выбранном, но ещё не сохранённом языке
+            using (var f = new SettingsForm(mods, key, lang, icon, CanRegister, at))
+            {
+                DialogResult r = f.ShowDialog();
+                if (r == DialogResult.Retry) { mods = f.Modifiers; key = f.Key; lang = f.Language; at = f.Location; continue; }
+                if (r != DialogResult.OK) return 1;
+                settings.Language = f.Language;
+                settings.Modifiers = f.Modifiers;
+                settings.Key = f.Key;
+                settings.Save();
+                Log.Info("Settings saved: hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + ", language " + Loc.Code);
+                return 0;
+            }
+        }
+    }
+
+    // Свободно ли сочетание в системе: пробная регистрация (основной процесс свой хоткей на это время снял)
+    static bool CanRegister(int mods, int key)
+    {
+        bool ok = RegisterHotKey(IntPtr.Zero, TEST_HOTKEY_ID, mods | Hotkey.MOD_NOREPEAT, key);
+        if (ok) UnregisterHotKey(IntPtr.Zero, TEST_HOTKEY_ID);
+        return ok;
+    }
+}

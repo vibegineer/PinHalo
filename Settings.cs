@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -44,8 +45,41 @@ static class Hotkey
     public static string Serialize(int mods, int vk)
     {
         var l = ModNames(mods);
-        l.Add(((Keys)vk).ToString());
+        l.Add(VkName(vk));
         return string.Join("+", l.ToArray());
+    }
+
+    // Имена как у enum Keys («T», «D1», «F5»), но без WinForms: основной процесс её не грузит.
+    // Для редких клавиш (Oemtilde, NumPad1, Insert…) — Keys, в отдельном методе: библиотека подгрузится только тогда.
+    static string VkName(int vk)
+    {
+        if (vk >= 'A' && vk <= 'Z') return ((char)vk).ToString();
+        if (vk >= '0' && vk <= '9') return "D" + (char)vk;
+        if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x6F);
+        return KeysName(vk);
+    }
+
+    static int VkFromName(string n)
+    {
+        if (n.Length == 1)
+        {
+            char c = char.ToUpperInvariant(n[0]);
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+        }
+        if (n.Length == 2 && (n[0] == 'D' || n[0] == 'd') && n[1] >= '0' && n[1] <= '9') return n[1];
+        int f;
+        if (n.Length >= 2 && (n[0] == 'F' || n[0] == 'f') && int.TryParse(n.Substring(1), out f) && f >= 1 && f <= 24) return 0x6F + f;
+        return KeysParse(n);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static string KeysName(int vk) { return ((Keys)vk).ToString(); }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int KeysParse(string n)
+    {
+        Keys k;
+        return Enum.TryParse<Keys>(n, true, out k) ? (int)(k & Keys.KeyCode) : 0;
     }
 
     public static bool TryParse(string s, out int mods, out int vk)
@@ -62,10 +96,8 @@ static class Hotkey
                 case "win": mods |= MOD_WIN; break;
                 default: return false;
             }
-        Keys k;
-        if (!Enum.TryParse<Keys>(p[p.Length - 1].Trim(), true, out k)) return false;
-        vk = (int)(k & Keys.KeyCode);
-        return IsAllowed(mods, vk);
+        vk = VkFromName(p[p.Length - 1].Trim());
+        return vk != 0 && IsAllowed(mods, vk);
     }
 
     public static bool IsModifierKey(int vk)
@@ -91,7 +123,7 @@ static class Hotkey
             var sb = new StringBuilder(64);
             if (GetKeyNameText((scan << 16) | (ext ? 1 << 24 : 0), sb, 64) > 0) return sb.ToString();
         }
-        return ((Keys)vk).ToString();
+        return VkName(vk);
     }
 }
 

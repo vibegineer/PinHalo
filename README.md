@@ -17,7 +17,7 @@ A small C# tray app with no dependencies. It builds with the compiler that ships
 - **Follows the window instantly.** Position comes from WinEvent hooks, not polling, so the frame doesn't lag behind while you drag or resize.
 - **Stays in the right layer.** The frame sits directly above its window, so windows above the pinned one cover both.
 - **Hides when it should:** window minimized, closed or fullscreen (video, games). For maximized windows the frame is drawn inside.
-- **Light.** About 0% CPU when idle; a 500 ms safety timer runs only while something is pinned.
+- **Light.** When idle: about 0% CPU and ~10 MB of memory. The background process is plain Win32 — no WinForms or GDI+ — and the Settings window runs as a separate short-lived process. A 1-second safety timer runs only while something is pinned.
 - **Per-monitor DPI aware.**
 - Tray icon: double-click opens Settings; the menu has *Settings…*, *Unpin all* and *Exit*. A notification appears on pin/unpin.
 
@@ -75,9 +75,10 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 
 | File | What it does |
 |---|---|
-| `AlwaysOnTop.cs` | Entry point, tray icon, hotkey, pinning, the frame overlay |
+| `AlwaysOnTop.cs` | Entry point, background process (hidden window, hotkey, pinning), the frame overlay |
+| `Tray.cs` | Tray icon and its menu |
 | `Settings.cs` | Hotkey parsing and formatting, `settings.ini` |
-| `SettingsForm.cs` | Settings window and the hotkey capture box |
+| `SettingsForm.cs` | Settings window, the hotkey capture box and the settings process |
 | `Strings.cs` | Loads translations, detects the system language |
 | `AssemblyInfo.cs` | Version and file properties of the exe |
 | `lang/*.lang` | Translations |
@@ -85,7 +86,9 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 
 ## How it works
 
-`BorderOverlay` creates one layered, click-through window per pinned window and draws a rounded ring into a DIB section with GDI+ (premultiplied alpha, `UpdateLayeredWindow`). A `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` hook limited to the pinned window's thread moves or redraws the frame; a global `EVENT_SYSTEM_FOREGROUND` hook keeps its z-order right. The ring is concentric with the window: inner radius equals the window corner radius (8 px × DPI scale on Windows 11), outer radius adds the thickness.
+The background process uses plain Win32 and loads nothing beyond `mscorlib`: a hidden window with its own message loop, `Shell_NotifyIcon` for the tray icon and `TrackPopupMenu` for its menu. The Settings window is the same exe started with `--settings`; WinForms is loaded only in that process, which exits when the window closes. The background process unregisters its hotkey while Settings is open and reloads `settings.ini` afterwards.
+
+`BorderOverlay` creates one layered, click-through window per pinned window and draws the ring itself into a DIB section: only the ring's pixels, antialiased from the distance to a rounded rectangle (premultiplied alpha, `UpdateLayeredWindow`). A `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` hook limited to the pinned window's thread moves or redraws the frame; a global `EVENT_SYSTEM_FOREGROUND` hook keeps its z-order right. The ring is concentric with the window: inner radius equals the window corner radius (8 px × DPI scale on Windows 11), outer radius adds the thickness.
 
 The hotkey box in Settings installs a `WH_KEYBOARD_LL` hook only while it has focus, so it sees a combination before any `RegisterHotKey` owner and before the shell. Whether a combination is free is checked with a trial `RegisterHotKey`.
 
