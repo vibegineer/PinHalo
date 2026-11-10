@@ -1,6 +1,7 @@
-# сборка (Install.ps1 / Build.ps1 собирают из исходника)
+# сборка (Install.ps1 / Build.ps1 собирают из исходника); файлы релиза — в GitHub Releases
 *.exe
 *.log
+dist/
 
 # локальные бэкапы и черновики
 *.bak

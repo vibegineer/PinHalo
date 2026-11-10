@@ -44,7 +44,13 @@ English, 简体中文, हिन्दी, Español, Français, العربية, 
 
 Windows 10 или 11 с .NET Framework 4.x (он установлен по умолчанию). Разработано и проверено только на Windows 11 (64-бит); на Windows 10 не тестировалось (см. примечание в начале).
 
-## Установка
+## Скачать
+
+Скачайте `AlwaysOnTop.exe` со страницы [Releases](https://github.com/vibegineer/PinHalo/releases/latest) и запустите — программа портативная, устанавливать ничего не нужно, она живёт в трее. Чтобы она запускалась вместе с Windows, используйте `Install.ps1` ниже или положите ярлык на exe в `shell:startup`.
+
+Exe не подписан цифровой подписью, поэтому при первом запуске Windows SmartScreen может предупредить: нажмите *Подробнее* → *Выполнить в любом случае*. В описании релиза указана его контрольная сумма SHA-256.
+
+## Установка из исходников
 
 ```powershell
 git clone https://github.com/vibegineer/PinHalo.git
@@ -73,6 +79,7 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 | `Settings.cs` | Разбор и формат хоткея, `settings.ini` |
 | `SettingsForm.cs` | Окно настроек и поле захвата сочетания |
 | `Strings.cs` | Загрузка переводов, определение языка системы |
+| `AssemblyInfo.cs` | Версия и свойства файла exe |
 | `lang/*.lang` | Переводы |
 | `Build.ps1`, `Install.ps1`, `Uninstall.ps1` | Сборка, установка, удаление |
 
@@ -81,3 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 `BorderOverlay` создаёт на каждое закреплённое окно одно layered-окно, прозрачное для кликов, и рисует скруглённое кольцо через GDI+ в DIB-секцию (premultiplied alpha, `UpdateLayeredWindow`). Хук `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)`, ограниченный потоком закреплённого окна, двигает или перерисовывает рамку; глобальный хук `EVENT_SYSTEM_FOREGROUND` держит правильный z-порядок. Кольцо концентрично окну: внутренний радиус равен радиусу скругления окна (8 px × масштаб DPI в Windows 11), внешний больше на толщину рамки.
 
 Поле горячей клавиши в настройках ставит хук `WH_KEYBOARD_LL` только пока оно в фокусе — так сочетание видно раньше, чем его получит владелец `RegisterHotKey` или оболочка. Свободно ли сочетание, проверяется пробной регистрацией `RegisterHotKey`.
+
+## Лицензия
+
+[MIT](LICENSE)

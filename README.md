@@ -44,7 +44,13 @@ To add a language: copy `lang/en.lang` to `lang/<code>.lang`, translate the valu
 
 Windows 10 or 11 with .NET Framework 4.x, which is preinstalled. Developed and tested on Windows 11 (64-bit) only; Windows 10 is untested (see the note at the top).
 
-## Install
+## Download
+
+Get `AlwaysOnTop.exe` from [Releases](https://github.com/vibegineer/PinHalo/releases/latest) and run it — it is portable, nothing to install, and lives in the tray. To start it with Windows, use `Install.ps1` below or put a shortcut to the exe into `shell:startup`.
+
+The exe is not code-signed, so Windows SmartScreen may warn on the first run: click *More info* → *Run anyway*. The release notes list its SHA-256 checksum.
+
+## Install from source
 
 ```powershell
 git clone https://github.com/vibegineer/PinHalo.git
@@ -73,6 +79,7 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 | `Settings.cs` | Hotkey parsing and formatting, `settings.ini` |
 | `SettingsForm.cs` | Settings window and the hotkey capture box |
 | `Strings.cs` | Loads translations, detects the system language |
+| `AssemblyInfo.cs` | Version and file properties of the exe |
 | `lang/*.lang` | Translations |
 | `Build.ps1`, `Install.ps1`, `Uninstall.ps1` | Build, install, uninstall |
 
@@ -81,3 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 `BorderOverlay` creates one layered, click-through window per pinned window and draws a rounded ring into a DIB section with GDI+ (premultiplied alpha, `UpdateLayeredWindow`). A `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` hook limited to the pinned window's thread moves or redraws the frame; a global `EVENT_SYSTEM_FOREGROUND` hook keeps its z-order right. The ring is concentric with the window: inner radius equals the window corner radius (8 px × DPI scale on Windows 11), outer radius adds the thickness.
 
 The hotkey box in Settings installs a `WH_KEYBOARD_LL` hook only while it has focus, so it sees a combination before any `RegisterHotKey` owner and before the shell. Whether a combination is free is checked with a trial `RegisterHotKey`.
+
+## License
+
+[MIT](LICENSE)
