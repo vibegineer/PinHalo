@@ -1,4 +1,5 @@
-// AlwaysOnTop v4 — Ctrl+Win+T + синяя рамка со скруглениями как у окон Windows 11
+// AlwaysOnTop v5 — закрепление окна по хоткею (по умолчанию Ctrl+Win+T) + синяя рамка со скруглениями как у окон Windows 11
+// v5: окно настроек (свой хоткей, язык), 20 языков интерфейса (lang\*.lang) с автовыбором по языку Windows.
 // Рамка = ОДНО окно на закреплённое: layered с попиксельной альфой (сглаженные скруглённые углы),
 // клики проходят насквозь. Позиция обновляется по событиям системы (SetWinEventHook), а не опросом —
 // рамка идёт за окном без отставания. Сторожевой таймер 500мс нужен только пока есть закрепления
@@ -19,6 +20,9 @@ static class Program
 {
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
+
+    const string Id = "AlwaysOnTop_CtrlWinT_Singleton";
 
     // Без этого на масштабе != 100% DWM отдаёт физические пиксели, а наши окна ставятся в виртуальных — рамка съезжает.
     static void EnableDpiAwareness()
@@ -28,17 +32,40 @@ static class Program
         try { SetProcessDPIAware(); } catch { }
     }
 
+    // Повторный запуск exe (из меню Пуск, ярлыка) открывает настройки уже работающей копии.
+    // Автозагрузка стартует с --autostart: дубль из второго пути автозапуска просто тихо выходит.
+    static void ShowSettingsInRunningInstance()
+    {
+        try
+        {
+            EventWaitHandle ev;
+            if (!EventWaitHandle.TryOpenExisting(Id + "_Settings", out ev)) return;
+            AllowSetForegroundWindow(-1); // ASFW_ANY: иначе Windows не выведет окно настроек на передний план
+            ev.Set();
+            ev.Close();
+        }
+        catch { }
+    }
+
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         bool created;
-        using (var m = new Mutex(true, "AlwaysOnTop_CtrlWinT_Singleton", out created))
+        using (var m = new Mutex(true, Id, out created))
         {
-            if (!created) return;
+            if (!created)
+            {
+                if (Array.IndexOf(args, "--autostart") < 0) ShowSettingsInRunningInstance();
+                return;
+            }
             EnableDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            using (var f = new MainForm())
+            // Программа живёт в трее: неожиданная ошибка пишется в лог, а не показывает окно WinForms и не роняет процесс
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => Log.Info("Unhandled: " + e.Exception);
+            using (var openSettings = new EventWaitHandle(false, EventResetMode.AutoReset, Id + "_Settings"))
+            using (var f = new MainForm(openSettings))
                 Application.Run(f);
         }
     }
@@ -191,8 +218,9 @@ sealed class BorderOverlay : NativeWindow, IDisposable
     {
         Target = target;
         const int WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80, WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x08000000;
+        // Класс окна — обычный WinForms (ClassName = null). Системный "Static" нельзя: WinForms суперклассирует его
+        // под тем же именем, что и "STATIC" у Label (Windows не различает регистр), и окно настроек потом падает.
         var cp = new CreateParams();
-        cp.ClassName = "Static";
         cp.Style = unchecked((int)0x80000000); // WS_POPUP
         cp.ExStyle = Native.WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
         cp.X = cp.Y = 0; cp.Width = cp.Height = 1;
@@ -360,10 +388,8 @@ sealed class BorderOverlay : NativeWindow, IDisposable
 
 sealed class MainForm : Form
 {
-    const int MOD_CONTROL = 0x0002, MOD_WIN = 0x0008, MOD_NOREPEAT = 0x4000; // NOREPEAT: удержание клавиш не щёлкает pin/unpin по кругу
-    const int VK_T = 0x54;
     const int WM_HOTKEY = 0x0312;
-    const int HOTKEY_ID = 1;
+    const int HOTKEY_ID = 1, TEST_HOTKEY_ID = 2;
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
     const uint WINEVENT_OUTOFCONTEXT = 0, WINEVENT_SKIPOWNPROCESS = 2;
     const int OBJID_WINDOW = 0;
@@ -384,11 +410,17 @@ sealed class MainForm : Form
     readonly WinEventProc winEventProc; // поле, чтобы делегат не собрал GC, пока хук жив
     readonly System.Windows.Forms.Timer timer;
     readonly NotifyIcon tray;
+    readonly ContextMenuStrip menu = new ContextMenuStrip();
+    readonly Settings settings = Settings.Load();
+    RegisteredWaitHandle settingsWait;
+    SettingsForm settingsForm;
+    bool hotkeyOk;
     IntPtr foregroundHook;
     int trayCount = -1;
 
-    public MainForm()
+    public MainForm(EventWaitHandle openSettings)
     {
+        Loc.Init(settings.Language);
         ShowInTaskbar = false;
         FormBorderStyle = FormBorderStyle.None;
         Opacity = 0;
@@ -407,19 +439,93 @@ sealed class MainForm : Form
         tray = new NotifyIcon();
         tray.Visible = true;
         tray.Icon = LoadTrayIcon();
-        tray.Text = "Always on Top (Ctrl+Win+T)";
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Снять все закрепления", null, (s, e) => UnpinAll());
-        menu.Items.Add("Выход", null, (s, e) => { UnpinAll(); Application.Exit(); });
         tray.ContextMenuStrip = menu;
+        tray.DoubleClick += (s, e) => OpenSettings();
+        BuildMenu();
+        UpdateTray();
 
-        if (!RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_T))
+        // Повторный запуск exe зовёт настройки работающей копии (поток пула -> UI-поток)
+        settingsWait = ThreadPool.RegisterWaitForSingleObject(openSettings, (state, timedOut) =>
         {
-            Log.Info("RegisterHotKey FAILED");
-            MessageBox.Show("Не удалось зарегистрировать Ctrl+Win+T.", "Always on Top",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            try { if (IsHandleCreated) BeginInvoke(new Action(OpenSettings)); }
+            catch (InvalidOperationException) { } // в т.ч. ObjectDisposedException: окно уже закрывается
+        }, null, Timeout.Infinite, false);
+
+        hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, settings.Modifiers | Hotkey.MOD_NOREPEAT, settings.Key); // NOREPEAT: удержание клавиш не щёлкает pin/unpin по кругу
+        if (hotkeyOk) Log.Info("Started, hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + " registered, language " + Loc.Code);
+        else
+        {
+            Log.Info("RegisterHotKey FAILED " + Hotkey.Serialize(settings.Modifiers, settings.Key));
+            // Окна ещё нет — показываем сообщение и настройки уже из цикла сообщений
+            Load += (s, e) => BeginInvoke(new Action(() =>
+            {
+                MessageBox.Show(Loc.T("Err.HotkeyRegister", Hotkey.Format(settings.Modifiers, settings.Key)), "Always on Top",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                OpenSettings();
+            }));
         }
-        else Log.Info("Started, hotkey registered");
+    }
+
+    void BuildMenu()
+    {
+        menu.Items.Clear();
+        menu.RightToLeft = Loc.IsRtl ? RightToLeft.Yes : RightToLeft.No;
+        menu.Items.Add(Loc.T("Menu.Settings"), null, (s, e) => OpenSettings());
+        menu.Items.Add(Loc.T("Menu.UnpinAll"), null, (s, e) => UnpinAll());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(Loc.T("Menu.Exit"), null, (s, e) => { UnpinAll(); Application.Exit(); });
+    }
+
+    // Свободно ли сочетание в системе: пробная регистрация под отдельным id
+    bool CanRegister(int mods, int key)
+    {
+        bool ok = RegisterHotKey(Handle, TEST_HOTKEY_ID, mods | Hotkey.MOD_NOREPEAT, key);
+        if (ok) UnregisterHotKey(Handle, TEST_HOTKEY_ID);
+        return ok;
+    }
+
+    void OpenSettings()
+    {
+        if (settingsForm != null) { settingsForm.Activate(); return; }
+        // Пока окно открыто, хоткей снят: иначе нажатие текущего сочетания сработало бы как команда, а не как ввод
+        if (hotkeyOk) UnregisterHotKey(Handle, HOTKEY_ID);
+        try
+        {
+            // Несохранённое состояние окна: переживает пересоздание окна при смене языка
+            int mods = settings.Modifiers, key = settings.Key;
+            string lang = settings.Language;
+            Point? at = null;
+            while (true)
+            {
+                Loc.Init(lang); // окно показывается на выбранном, но ещё не сохранённом языке
+                using (var f = new SettingsForm(mods, key, lang, tray.Icon, CanRegister, at))
+                {
+                    settingsForm = f;
+                    DialogResult r = f.ShowDialog();
+                    if (r == DialogResult.Retry) { mods = f.Modifiers; key = f.Key; lang = f.Language; at = f.Location; continue; }
+                    if (r == DialogResult.OK)
+                    {
+                        settings.Language = f.Language;
+                        settings.Modifiers = f.Modifiers;
+                        settings.Key = f.Key;
+                        settings.Save();
+                        Log.Info("Settings saved: hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + ", language " + Loc.Code);
+                    }
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            settingsForm = null;
+            Loc.Init(settings.Language); // после «Отмены» язык возвращается к сохранённому
+            BuildMenu();
+            hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, settings.Modifiers | Hotkey.MOD_NOREPEAT, settings.Key);
+            if (!hotkeyOk)
+                tray.ShowBalloonTip(3000, "Always on Top", Loc.T("Err.HotkeyRegister", Hotkey.Format(settings.Modifiers, settings.Key)), ToolTipIcon.Warning);
+            trayCount = -1; // пересобрать подсказку: поменялись язык и сочетание
+            UpdateTray();
+        }
     }
 
     protected override void WndProc(ref Message m)
@@ -456,7 +562,7 @@ sealed class MainForm : Form
     {
         var sb = new StringBuilder(256);
         GetWindowText(h, sb, 256);
-        return sb.Length == 0 ? "(окно без названия)" : sb.ToString();
+        return sb.Length == 0 ? Loc.T("Toast.Untitled") : sb.ToString();
     }
 
     // Рабочий стол, панель задач и её всплывающие окна закреплять незачем — они и так живут поверх всего.
@@ -476,9 +582,9 @@ sealed class MainForm : Form
         if (!Native.IsWindow(hwnd) || IsShellWindow(hwnd)) return;
         foreach (var ov in pinned.Values) if (ov.Handle == hwnd) return; // свою рамку не трогаем
 
-        if (pinned.ContainsKey(hwnd)) { Unpin(hwnd); tray.ShowBalloonTip(800, "Always on Top", "Откреплено: " + Title(hwnd), ToolTipIcon.Info); Log.Info("Unpin " + hwnd); }
-        else if (Pin(hwnd)) { tray.ShowBalloonTip(800, "Always on Top", "Закреплено поверх всех: " + Title(hwnd), ToolTipIcon.Info); Log.Info("Pin " + hwnd + " rect=" + Native.GetFrameBounds(hwnd)); }
-        else { tray.ShowBalloonTip(1500, "Always on Top", "Не удалось закрепить (окно запущено от администратора?): " + Title(hwnd), ToolTipIcon.Warning); Log.Info("Pin FAILED " + hwnd); }
+        if (pinned.ContainsKey(hwnd)) { Unpin(hwnd); tray.ShowBalloonTip(800, "Always on Top", Loc.T("Toast.Unpinned", Title(hwnd)), ToolTipIcon.Info); Log.Info("Unpin " + hwnd); }
+        else if (Pin(hwnd)) { tray.ShowBalloonTip(800, "Always on Top", Loc.T("Toast.Pinned", Title(hwnd)), ToolTipIcon.Info); Log.Info("Pin " + hwnd + " rect=" + Native.GetFrameBounds(hwnd)); }
+        else { tray.ShowBalloonTip(1500, "Always on Top", Loc.T("Toast.PinFailed", Title(hwnd)), ToolTipIcon.Warning); Log.Info("Pin FAILED " + hwnd); }
         UpdateTray();
     }
 
@@ -536,7 +642,8 @@ sealed class MainForm : Form
     {
         if (trayCount == pinned.Count) return; // не дёргаем шелл, если ничего не изменилось
         trayCount = pinned.Count;
-        tray.Text = trayCount == 0 ? "Always on Top (Ctrl+Win+T)" : ("Закреплено: " + trayCount);
+        string text = trayCount == 0 ? "Always on Top (" + Hotkey.Format(settings.Modifiers, settings.Key) + ")" : Loc.T("Tray.Pinned", trayCount);
+        tray.Text = text.Length > 63 ? text.Substring(0, 63) : text; // NotifyIcon.Text не принимает больше 63 символов
     }
 
     void RefreshBorders()
@@ -559,6 +666,7 @@ sealed class MainForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         try { timer.Stop(); } catch { }
+        if (settingsWait != null) settingsWait.Unregister(null);
         UnregisterHotKey(Handle, HOTKEY_ID);
         foreach (var k in new List<IntPtr>(pinned.Keys)) Release(k);
         base.OnFormClosing(e);

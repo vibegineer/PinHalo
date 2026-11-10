@@ -1,0 +1,23 @@
+# English — base language: every other file falls back to these strings for any missing key.
+# Format: key=value (UTF-8). Lines starting with # are comments. {0} is replaced by the program.
+Lang.Name=English
+Tray.Pinned=Pinned: {0}
+Menu.Settings=Settings…
+Menu.UnpinAll=Unpin all
+Menu.Exit=Exit
+Toast.Pinned=Pinned on top: {0}
+Toast.Unpinned=Unpinned: {0}
+Toast.PinFailed=Couldn't pin (does the window run as administrator?): {0}
+Toast.Untitled=(untitled window)
+Err.HotkeyRegister=Couldn't register {0}: another program already uses it. Choose a different combination in Settings.
+Settings.Title=Settings
+Settings.Hotkey=Hotkey
+Settings.HotkeyHint=Click the box and press the combination you want.
+Settings.Default=Default
+Settings.Language=Language
+Settings.LangAuto=Automatic (system language)
+Settings.Save=Save
+Settings.Cancel=Cancel
+Settings.Press=Press a combination…
+Err.NeedModifier=Use Ctrl, Alt, Shift or Win together with another key.
+Err.HotkeyBusy={0} is already used by another program. Choose a different combination.
