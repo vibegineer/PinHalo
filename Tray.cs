@@ -9,7 +9,7 @@ sealed class TrayIcon : IDisposable
     const uint NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETVERSION = 4;
     const uint NIF_MESSAGE = 0x1, NIF_ICON = 0x2, NIF_TIP = 0x4, NIF_INFO = 0x10, NIF_SHOWTIP = 0x80;
     const uint NIIF_INFO = 0x1, NIIF_WARNING = 0x2;
-    const uint MF_STRING = 0x0, MF_SEPARATOR = 0x800;
+    const uint MF_STRING = 0x0, MF_CHECKED = 0x8, MF_SEPARATOR = 0x800;
     const uint TPM_RIGHTBUTTON = 0x2, TPM_NONOTIFY = 0x80, TPM_RETURNCMD = 0x100, TPM_LAYOUTRTL = 0x8000;
     const int IDI_APP_ICON = 32512; // так csc /win32icon называет группу иконок в exe
 
@@ -103,14 +103,15 @@ sealed class TrayIcon : IDisposable
         x = p.X; y = p.Y;
     }
 
-    // Родное меню Windows. items: null — разделитель. Возвращает номер пункта с 1 (0 — меню закрыли).
-    public int ShowMenu(int x, int y, string[] items, bool rtl)
+    // Родное меню Windows. items: null — разделитель; checks: у каких пунктов галочка (может быть null).
+    // Возвращает номер пункта с 1 (0 — меню закрыли).
+    public int ShowMenu(int x, int y, string[] items, bool[] checks, bool rtl)
     {
         IntPtr m = CreatePopupMenu();
         for (int i = 0; i < items.Length; i++)
         {
             if (items[i] == null) AppendMenu(m, MF_SEPARATOR, UIntPtr.Zero, null);
-            else AppendMenu(m, MF_STRING, new UIntPtr((uint)(i + 1)), items[i]);
+            else AppendMenu(m, MF_STRING | (checks != null && checks[i] ? MF_CHECKED : 0), new UIntPtr((uint)(i + 1)), items[i]);
         }
         Native.SetForegroundWindow(hwnd); // без этого меню не закрывается щелчком мимо
         int cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | (rtl ? TPM_LAYOUTRTL : 0), x, y, hwnd, IntPtr.Zero);

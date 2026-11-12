@@ -4,11 +4,12 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-// Поле захвата сочетания клавиш: показывает и запоминает нажатую комбинацию.
-// Пока поле в фокусе, стоит низкоуровневый перехват клавиатуры (WH_KEYBOARD_LL). Он видит сочетание раньше
-// чужих хоткеев и самой Windows и не даёт им сработать: иначе занятое сочетание просто «не вводилось бы»,
-// а Win+D при попытке ввода свернул бы все окна.
-sealed class HotkeyBox : TextBox
+// Одно сочетание в окне настроек: поле с текущим сочетанием и кнопка «Изменить».
+// Сочетание ждём только после нажатия кнопки (или щелчка по полю). На время ввода ставится низкоуровневый
+// перехват клавиатуры (WH_KEYBOARD_LL): он видит сочетание раньше чужих хоткеев и самой Windows и не даёт им
+// сработать — иначе занятое сочетание просто «не вводилось бы», а Win+D при попытке ввода свернул бы все окна.
+// Esc, Enter или повторное нажатие кнопки отменяют ввод; Backspace отключает необязательное сочетание.
+sealed class HotkeyField
 {
     delegate IntPtr LowLevelProc(int code, IntPtr wParam, IntPtr lParam);
     [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public int vkCode, scanCode, flags, time; public IntPtr extra; }
@@ -17,47 +18,78 @@ sealed class HotkeyBox : TextBox
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
-    [DllImport("user32.dll")] static extern bool HideCaret(IntPtr hWnd);
     const int WH_KEYBOARD_LL = 13, WM_KEYDOWN = 0x0100, WM_SYSKEYDOWN = 0x0104;
 
+    public readonly Label Box;
+    public readonly Button Button;
+    public readonly bool Optional;             // можно отключить (Backspace во время ввода)
     public int Modifiers { get; private set; }
-    public int Key { get; private set; }
-    public event Action<string> Rejected;
+    public int Key { get; private set; }       // 0 — сочетание отключено
+    public bool Capturing { get; private set; }
+    public bool HookActive { get { return hook != IntPtr.Zero; } }
+    public event Action<string> Message;       // текст для общей подписи; "" — вернуть подсказку
+    public event EventHandler Started, Finished;
+
     readonly LowLevelProc hookProc;                  // поле: делегат не должен собраться GC, пока хук стоит
     readonly HashSet<int> held = new HashSet<int>(); // зажатые модификаторы (левый и правый отдельно)
     IntPtr hook;
-    bool captured;
+    bool draining;                                   // сочетание принято, ждём отпускания модификаторов
 
-    public HotkeyBox(int mods, int key)
+    public HotkeyField(int mods, int key, bool optional)
     {
-        Modifiers = mods; Key = key;
+        Modifiers = mods; Key = key; Optional = optional;
         hookProc = OnHook;
-        ReadOnly = true;
-        ShortcutsEnabled = false;
-        BackColor = SystemColors.Window;
-        TextAlign = HorizontalAlignment.Center;
-        RightToLeft = RightToLeft.No; // «Ctrl + Win + T» всегда слева направо, даже в арабском и урду
+        Box = new Label
+        {
+            AutoSize = false, BorderStyle = BorderStyle.FixedSingle, BackColor = SystemColors.Window,
+            TextAlign = ContentAlignment.MiddleCenter, UseMnemonic = false,
+            RightToLeft = RightToLeft.No // «Ctrl + Win + T» всегда слева направо, даже в арабском и урду
+        };
+        Box.Click += (o, e) => Start();
+        Button = new Button { Text = Loc.T("Settings.Change"), UseVisualStyleBackColor = true };
+        Button.Click += (o, e) => { if (Capturing) Stop(); else Start(); };
         ShowCurrent();
     }
 
-    public void Set(int mods, int key) { Modifiers = mods; Key = key; captured = true; ShowCurrent(); }
+    public void Set(int mods, int key) { Stop(); Modifiers = mods; Key = key; ShowCurrent(); }
 
-    void ShowCurrent() { ForeColor = SystemColors.WindowText; Text = Hotkey.Format(Modifiers, Key); }
-    void ShowPrompt() { ForeColor = SystemColors.GrayText; Text = Loc.T("Settings.Press"); }
+    void ShowCurrent() { Box.ForeColor = SystemColors.WindowText; Box.Text = Key == 0 ? Loc.T("Settings.None") : Hotkey.Format(Modifiers, Key); }
+    void ShowPrompt() { Box.ForeColor = SystemColors.GrayText; Box.Text = Loc.T("Settings.Press"); }
+    void Say(string text) { if (Message != null) Message(text); }
 
-    protected override void OnGotFocus(EventArgs e)
+    public void Start()
     {
-        base.OnGotFocus(e);
-        HideCaret(Handle); // печатать в поле нельзя — мигающий курсор только путает
-        captured = false;
+        if (Capturing) return;
+        Unhook(); // мог остаться от прошлого ввода, пока отпускали модификаторы
+        Capturing = true;
         held.Clear();
+        Button.Text = Loc.T("Settings.Cancel");
         ShowPrompt();
-        if (hook == IntPtr.Zero) hook = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, GetModuleHandle(null), 0);
-        if (hook == IntPtr.Zero) Log.Info("Keyboard hook FAILED, hotkey box falls back to normal key events");
+        hook = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, GetModuleHandle(null), 0);
+        if (hook == IntPtr.Zero) Log.Info("Keyboard hook FAILED, hotkey input falls back to normal key events");
+        Say(string.Empty);
+        if (Started != null) Started(this, EventArgs.Empty);
     }
-    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Unhook(); ShowCurrent(); }
-    protected override void OnHandleDestroyed(EventArgs e) { Unhook(); base.OnHandleDestroyed(e); }
-    void Unhook() { if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; } }
+
+    // Закончить ввод. drain: если модификаторы ещё зажаты, перехват остаётся до их отпускания —
+    // иначе отпускание Win дошло бы до системы и открыло меню «Пуск».
+    void Finish(bool drain)
+    {
+        if (!Capturing) return;
+        Capturing = false;
+        if (drain && held.Count > 0) draining = true; else Unhook();
+        Button.Text = Loc.T("Settings.Change");
+        ShowCurrent();
+        if (Finished != null) Finished(this, EventArgs.Empty);
+    }
+
+    public void Stop() { Finish(false); }
+
+    void Unhook()
+    {
+        draining = false;
+        if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
+    }
 
     static int ModBit(int vk)
     {
@@ -71,81 +103,101 @@ sealed class HotkeyBox : TextBox
         }
     }
 
+    int HeldMods()
+    {
+        int mods = 0;
+        foreach (int vk in held) mods |= ModBit(vk);
+        return mods;
+    }
+
     IntPtr OnHook(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code < 0) return CallNextHookEx(hook, code, wParam, lParam);
+        IntPtr h = hook;
+        if (code < 0) return CallNextHookEx(h, code, wParam, lParam);
         var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
         int msg = wParam.ToInt32();
         bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        if (ModBit(k.vkCode) != 0)
+        int vk = k.vkCode;
+
+        if (draining)
         {
-            if (down) held.Add(k.vkCode); else held.Remove(k.vkCode);
-            int mods = 0;
-            foreach (int vk in held) mods |= ModBit(vk);
-            if (down) OnModifiers(mods);
-            else if (held.Count == 0 && !captured) ShowPrompt(); // отпустили модификаторы, не выбрав клавишу
+            if (ModBit(vk) != 0 && !down)
+            {
+                held.Remove(vk);
+                if (held.Count == 0) Unhook();
+                return new IntPtr(1); // глотаем отпускание модификатора, нажатие которого тоже проглотили
+            }
+            Unhook();
+            return CallNextHookEx(h, code, wParam, lParam);
+        }
+        if (!Capturing) return CallNextHookEx(h, code, wParam, lParam);
+
+        if (ModBit(vk) != 0)
+        {
+            if (down) { held.Add(vk); Preview(HeldMods()); }
+            else { held.Remove(vk); if (held.Count == 0) ShowPrompt(); } // отпустили модификаторы, не выбрав клавишу
             return new IntPtr(1);
         }
-        // Голые Tab/Esc/Enter — навигация по диалогу (следующее поле, отмена, сохранить)
-        if (held.Count == 0 && (k.vkCode == 0x09 || k.vkCode == 0x1B || k.vkCode == 0x0D))
-            return CallNextHookEx(hook, code, wParam, lParam);
-        if (down)
+        if (held.Count == 0)
         {
-            int mods = 0;
-            foreach (int vk in held) mods |= ModBit(vk);
-            OnCombo(mods, k.vkCode);
+            if (vk == 0x09) { if (down) Stop(); return CallNextHookEx(h, code, wParam, lParam); } // Tab — дальше по окну
+            if (vk == 0x1B || vk == 0x0D) { if (down) Stop(); return new IntPtr(1); }          // Esc, Enter — отменить ввод
+            if (vk == 0x08 || vk == 0x2E) { if (down) Clear(); return new IntPtr(1); }          // Backspace, Delete
         }
-        return new IntPtr(1); // проглатываем: пока выбираем, чужие хоткеи и сочетания Windows не срабатывают
+        if (down) Combo(HeldMods(), vk);
+        return new IntPtr(1); // проглатываем: пока ждём сочетание, чужие хоткеи и сочетания Windows не срабатывают
     }
 
-    void OnModifiers(int mods)
+    void Preview(int mods)
     {
-        if (captured) return;
-        ForeColor = SystemColors.GrayText;
-        Text = Hotkey.Preview(mods);
+        Box.ForeColor = SystemColors.GrayText;
+        Box.Text = Hotkey.Preview(mods);
     }
 
-    void OnCombo(int mods, int vk)
+    void Clear()
+    {
+        if (!Optional) { Say(Loc.T("Err.NeedModifier")); return; }
+        Modifiers = 0; Key = 0;
+        Finish(false);
+        Say(string.Empty);
+    }
+
+    void Combo(int mods, int vk)
     {
         if (!Hotkey.IsAllowed(mods, vk))
         {
             ShowPrompt();
-            if (Rejected != null) Rejected(Loc.T("Err.NeedModifier"));
+            Say(Loc.T("Err.NeedModifier"));
             return;
         }
-        Set(mods, vk);
-        if (Rejected != null) Rejected(string.Empty);
+        Modifiers = mods; Key = vk;
+        Finish(true);
+        Say(string.Empty);
     }
 
-    // Запасной путь — обычные события клавиатуры (если перехват не поставился). Голые Tab/Esc/Enter остаются навигацией.
-    protected override bool IsInputKey(Keys keyData)
+    // Запасной путь, если перехват не поставился: клавиши приходят окну настроек обычным образом
+    public bool FallbackKey(Keys keyData)
     {
-        Keys k = keyData & Keys.KeyCode;
-        if ((keyData & Keys.Modifiers) == 0 && (k == Keys.Tab || k == Keys.Escape || k == Keys.Return)) return false;
+        if (!Capturing || HookActive) return false;
+        int vk = (int)(keyData & Keys.KeyCode);
+        bool win = GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
+        int mods = ((keyData & Keys.Control) != 0 ? Hotkey.MOD_CONTROL : 0) | ((keyData & Keys.Alt) != 0 ? Hotkey.MOD_ALT : 0)
+                 | ((keyData & Keys.Shift) != 0 ? Hotkey.MOD_SHIFT : 0) | (win ? Hotkey.MOD_WIN : 0);
+        if (Hotkey.IsModifierKey(vk)) { Preview(mods); return true; }
+        if (mods == 0)
+        {
+            if (vk == 0x09) { Stop(); return false; }
+            if (vk == 0x1B || vk == 0x0D) { Stop(); return true; }
+            if (vk == 0x08 || vk == 0x2E) { Clear(); return true; }
+        }
+        Combo(mods, vk);
         return true;
     }
 
-    protected override void OnKeyDown(KeyEventArgs e)
-    {
-        e.Handled = true;
-        e.SuppressKeyPress = true;
-        if (hook != IntPtr.Zero) return; // всё уже обработал перехват
-        bool win = GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
-        int mods = (e.Control ? Hotkey.MOD_CONTROL : 0) | (e.Alt ? Hotkey.MOD_ALT : 0)
-                 | (e.Shift ? Hotkey.MOD_SHIFT : 0) | (win ? Hotkey.MOD_WIN : 0);
-        int vk = (int)e.KeyCode;
-        if (Hotkey.IsModifierKey(vk)) OnModifiers(mods);
-        else OnCombo(mods, vk);
-    }
-
-    protected override void OnKeyUp(KeyEventArgs e)
-    {
-        base.OnKeyUp(e);
-        if (hook == IntPtr.Zero && !captured && Focused) ShowPrompt();
-    }
+    public void Dispose() { Capturing = false; Unhook(); }
 }
 
-// Окно настроек: хоткей и язык. Раскладка считается вручную от DPI и размера шрифта, чтобы работать и при масштабе экрана > 100%.
+// Окно настроек: два сочетания и язык. Раскладка считается вручную от DPI и размера шрифта, чтобы работать и при масштабе экрана > 100%.
 sealed class SettingsForm : Form
 {
     sealed class LangItem
@@ -155,26 +207,28 @@ sealed class SettingsForm : Form
         public override string ToString() { return Text; }
     }
 
-    readonly Func<int, int, bool> canRegister;
-    readonly HotkeyBox box;
-    readonly ComboBox lang;
-    readonly Label note;
-    readonly string hint;
-
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
+    readonly Func<int, int, bool> canRegister;
+    readonly HotkeyField pin, unpin;
+    readonly ComboBox lang;
+    readonly Label note;
+    readonly Button save;
+    readonly string hint;
     readonly bool reopened;
 
-    public int Modifiers { get { return box.Modifiers; } }
-    public int Key { get { return box.Key; } }
+    public int Modifiers { get { return pin.Modifiers; } }
+    public int Key { get { return pin.Key; } }
+    public int UnpinModifiers { get { return unpin.Modifiers; } }
+    public int UnpinKey { get { return unpin.Key; } }
     public string Language { get; private set; }
 
     // Окно всегда строится на текущем языке Loc. Выбор другого языка закрывает окно с DialogResult.Retry,
-    // и MainForm сразу открывает его заново на новом языке: так верно зеркалятся и арабский/урду, которые Windows
+    // и SettingsApp сразу открывает его заново на новом языке: так верно зеркалятся и арабский/урду, которые Windows
     // разворачивает только при создании окна.
-    // canRegister: свободно ли сочетание в системе (его проверяет главное окно).
+    // canRegister: свободно ли сочетание в системе.
     // location: где стояло прежнее окно при пересоздании (null — первое открытие, по центру экрана).
-    public SettingsForm(int mods, int key, string language, Icon icon, Func<int, int, bool> canRegister, Point? location)
+    public SettingsForm(int mods, int key, int unpinMods, int unpinKey, string language, Icon icon, Func<int, int, bool> canRegister, Point? location)
     {
         this.canRegister = canRegister;
         Language = language;
@@ -191,39 +245,46 @@ sealed class SettingsForm : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
+        KeyPreview = true;
         if (reopened) { StartPosition = FormStartPosition.Manual; Location = location.Value; }
         else StartPosition = FormStartPosition.CenterScreen;
         RightToLeft = Loc.IsRtl ? RightToLeft.Yes : RightToLeft.No;
         RightToLeftLayout = Loc.IsRtl; // зеркалит окно целиком, поэтому координаты ниже задаём как для LTR
 
-        int W = S(400), M = S(16), CW = W - 2 * M, y = M;
+        int W = S(420), M = S(16), CW = W - 2 * M, y = M;
         int line = Font.Height;
-        int fieldH = line + S(10);
+        int fieldH = line + S(12);
         var flags = TextFormatFlags.WordBreak;
 
-        Controls.Add(MakeLabel(Loc.T("Settings.Hotkey"), M, y, CW, line, SystemColors.ControlText));
-        y += line + S(6);
-
-        string defText = Loc.T("Settings.Default");
-        int defW = Math.Max(S(90), TextRenderer.MeasureText(defText, Font).Width + S(28));
-        box = new HotkeyBox(mods, key);
-        box.SetBounds(M, y, CW - defW - S(8), fieldH);
-        Controls.Add(box);
-        int boxH = box.Height; // высоту однострочного TextBox задаёт шрифт, а не SetBounds
-        var reset = new Button { Text = defText, UseVisualStyleBackColor = true };
-        reset.SetBounds(M + CW - defW, y - 1, defW, boxH + 2);
-        reset.Click += (o, e) => { box.Set(Hotkey.DefaultMods, Hotkey.DefaultKey); ShowError(string.Empty); };
-        Controls.Add(reset);
-        y += boxH + S(8);
+        // Кнопка меняет надпись «Изменить» ↔ «Отмена» — ширина по более длинной
+        int btnW = Math.Max(S(96), Math.Max(TextRenderer.MeasureText(Loc.T("Settings.Change"), Font).Width,
+                                             TextRenderer.MeasureText(Loc.T("Settings.Cancel"), Font).Width) + S(28));
+        pin = new HotkeyField(mods, key, false);
+        unpin = new HotkeyField(unpinMods, unpinKey, true);
+        foreach (var f in new[] { pin, unpin })
+        {
+            string caption = Loc.T(f == pin ? "Settings.HotkeyPin" : "Settings.HotkeyUnpinAll");
+            int capH = TextRenderer.MeasureText(caption, Font, new Size(CW, 0), flags).Height;
+            Controls.Add(MakeLabel(caption, M, y, CW, capH, SystemColors.ControlText));
+            y += capH + S(6);
+            f.Box.SetBounds(M, y, CW - btnW - S(8), fieldH);
+            f.Button.SetBounds(M + CW - btnW, y - 1, btnW, fieldH + 2);
+            Controls.Add(f.Box);
+            Controls.Add(f.Button);
+            y += fieldH + S(14);
+        }
+        HotkeyField a = pin, b = unpin;
+        a.Started += (o, e) => b.Stop(); // ждём только одно сочетание за раз
+        b.Started += (o, e) => a.Stop();
 
         // Подсказка и ошибки — в одной подписи; высота по самому длинному тексту, чтобы окно не прыгало
         hint = Loc.T("Settings.HotkeyHint");
         int noteH = 0;
-        foreach (string sample in new[] { hint, Loc.T("Err.NeedModifier"), Loc.T("Err.HotkeyBusy", "Ctrl + Alt + Shift + Win + F12") })
+        foreach (string sample in new[] { hint, Loc.T("Err.NeedModifier"), Loc.T("Err.HotkeyBusy", "Ctrl + Alt + Shift + Win + F12"), Loc.T("Err.HotkeySame") })
             noteH = Math.Max(noteH, TextRenderer.MeasureText(sample, Font, new Size(CW, 0), flags).Height);
-        note = MakeLabel(hint, M, y, CW, noteH, SystemColors.GrayText);
+        note = MakeLabel(hint, M, y - S(4), CW, noteH, SystemColors.GrayText);
         Controls.Add(note);
-        y += noteH + S(14);
+        y += noteH + S(10);
 
         Controls.Add(MakeLabel(Loc.T("Settings.Language"), M, y, CW, line, SystemColors.ControlText));
         y += line + S(6);
@@ -238,15 +299,25 @@ sealed class SettingsForm : Form
         Controls.Add(lang);
         y += lang.Height + S(20);
 
-        string saveText = Loc.T("Settings.Save"), cancelText = Loc.T("Settings.Cancel");
-        int bh = fieldH + S(6);
+        string saveText = Loc.T("Settings.Save"), cancelText = Loc.T("Settings.Cancel"), defText = Loc.T("Settings.Default");
+        int bh = fieldH + S(4);
         int cw = Math.Max(S(88), TextRenderer.MeasureText(cancelText, Font).Width + S(28));
         int sw = Math.Max(S(88), TextRenderer.MeasureText(saveText, Font).Width + S(28));
+        int dw = Math.Max(S(88), TextRenderer.MeasureText(defText, Font).Width + S(28));
+        var reset = new Button { Text = defText, UseVisualStyleBackColor = true };
+        reset.SetBounds(M, y, dw, bh);
+        reset.Click += (o, e) =>
+        {
+            pin.Set(Hotkey.DefaultMods, Hotkey.DefaultKey);
+            unpin.Set(Hotkey.DefaultUnpinMods, Hotkey.DefaultUnpinKey);
+            ShowError(string.Empty);
+        };
         var cancel = new Button { Text = cancelText, DialogResult = DialogResult.Cancel, UseVisualStyleBackColor = true };
         cancel.SetBounds(W - M - cw, y, cw, bh);
-        var save = new Button { Text = saveText, UseVisualStyleBackColor = true };
+        save = new Button { Text = saveText, UseVisualStyleBackColor = true };
         save.SetBounds(W - M - cw - S(8) - sw, y, sw, bh);
         save.Click += OnSave;
+        Controls.Add(reset);
         Controls.Add(cancel);
         Controls.Add(save);
         AcceptButton = save;
@@ -254,9 +325,23 @@ sealed class SettingsForm : Form
         y += bh + M;
 
         ClientSize = new Size(W, y);
-        box.Rejected += ShowError;
-        if (reopened) ActiveControl = lang; // фокус остаётся в списке: стрелками можно листать языки дальше
+        foreach (var f in new[] { pin, unpin })
+        {
+            f.Message += ShowError;
+            f.Finished += (o, e) => { if (Visible && ContainsFocus) save.Focus(); }; // Enter после ввода = «Сохранить»
+        }
+        // Сочетание ждём только по кнопке: при открытии фокус на списке языков, а не в поле
+        ActiveControl = lang;
+        Deactivate += (o, e) => { pin.Stop(); unpin.Stop(); };   // ушли в другое окно — перестаём перехватывать клавиши
+        FormClosing += (o, e) => { pin.Dispose(); unpin.Dispose(); };
         Shown += (o, e) => { TopMost = true; TopMost = false; Activate(); }; // окно открывается из трея — выводим его вперёд
+    }
+
+    // Запасной ввод сочетания, если перехват клавиатуры не поставился
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (pin.FallbackKey(keyData) || unpin.FallbackKey(keyData)) return true;
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     // Пересоздание окна на том же месте не должно «мигать» анимацией закрытия/открытия
@@ -278,7 +363,7 @@ sealed class SettingsForm : Form
         if (code == Language) return;
         Language = code;
         DisableTransitions();
-        DialogResult = DialogResult.Retry; // MainForm откроет окно заново на выбранном языке
+        DialogResult = DialogResult.Retry; // SettingsApp откроет окно заново на выбранном языке
     }
 
     Label MakeLabel(string text, int x, int y, int w, int h, Color color)
@@ -297,18 +382,17 @@ sealed class SettingsForm : Form
 
     void OnSave(object sender, EventArgs e)
     {
-        if (!canRegister(box.Modifiers, box.Key))
-        {
-            ShowError(Loc.T("Err.HotkeyBusy", Hotkey.Format(box.Modifiers, box.Key)));
-            return;
-        }
+        pin.Stop(); unpin.Stop();
+        if (unpin.Key != 0 && unpin.Key == pin.Key && unpin.Modifiers == pin.Modifiers) { ShowError(Loc.T("Err.HotkeySame")); return; }
+        if (!canRegister(pin.Modifiers, pin.Key)) { ShowError(Loc.T("Err.HotkeyBusy", Hotkey.Format(pin.Modifiers, pin.Key))); return; }
+        if (unpin.Key != 0 && !canRegister(unpin.Modifiers, unpin.Key)) { ShowError(Loc.T("Err.HotkeyBusy", Hotkey.Format(unpin.Modifiers, unpin.Key))); return; }
         Language = ((LangItem)lang.SelectedItem).Code;
         DialogResult = DialogResult.OK;
     }
 }
 
 // Процесс окна настроек: AlwaysOnTop.exe --settings [--hotkey-busy]. WinForms и GDI+ грузятся только здесь
-// и уходят вместе с процессом. Код выхода: 0 — сохранено, 1 — отмена. Основной процесс на это время снимает свой хоткей.
+// и уходят вместе с процессом. Код выхода: 0 — сохранено, 1 — отмена. Основной процесс на это время снимает свои хоткеи.
 static class SettingsApp
 {
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, int mod, int vk);
@@ -338,28 +422,37 @@ static class SettingsApp
                 Loc.IsRtl ? MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign : (MessageBoxOptions)0);
 
         // Несохранённое состояние окна: переживает пересоздание окна при смене языка
-        int mods = settings.Modifiers, key = settings.Key;
+        int mods = settings.Modifiers, key = settings.Key, umods = settings.UnpinModifiers, ukey = settings.UnpinKey;
         string lang = settings.Language;
         Point? at = null;
         while (true)
         {
             Loc.Init(lang); // окно показывается на выбранном, но ещё не сохранённом языке
-            using (var f = new SettingsForm(mods, key, lang, icon, CanRegister, at))
+            using (var f = new SettingsForm(mods, key, umods, ukey, lang, icon, CanRegister, at))
             {
                 DialogResult r = f.ShowDialog();
-                if (r == DialogResult.Retry) { mods = f.Modifiers; key = f.Key; lang = f.Language; at = f.Location; continue; }
+                if (r == DialogResult.Retry)
+                {
+                    mods = f.Modifiers; key = f.Key; umods = f.UnpinModifiers; ukey = f.UnpinKey;
+                    lang = f.Language; at = f.Location;
+                    continue;
+                }
                 if (r != DialogResult.OK) return 1;
                 settings.Language = f.Language;
                 settings.Modifiers = f.Modifiers;
                 settings.Key = f.Key;
+                settings.UnpinModifiers = f.UnpinModifiers;
+                settings.UnpinKey = f.UnpinKey;
                 settings.Save();
-                Log.Info("Settings saved: hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + ", language " + Loc.Code);
+                Log.Info("Settings saved: hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key)
+                    + ", unpin all " + (settings.UnpinKey == 0 ? "None" : Hotkey.Serialize(settings.UnpinModifiers, settings.UnpinKey))
+                    + ", language " + Loc.Code);
                 return 0;
             }
         }
     }
 
-    // Свободно ли сочетание в системе: пробная регистрация (основной процесс свой хоткей на это время снял)
+    // Свободно ли сочетание в системе: пробная регистрация (основной процесс свои хоткеи на это время снял)
     static bool CanRegister(int mods, int key)
     {
         bool ok = RegisterHotKey(IntPtr.Zero, TEST_HOTKEY_ID, mods | Hotkey.MOD_NOREPEAT, key);

@@ -10,7 +10,8 @@ using System.Windows.Forms;
 static class Hotkey
 {
     public const int MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_SHIFT = 0x0004, MOD_WIN = 0x0008, MOD_NOREPEAT = 0x4000;
-    public const int DefaultMods = MOD_CONTROL | MOD_WIN, DefaultKey = 0x54; // Ctrl+Win+T
+    public const int DefaultMods = MOD_CONTROL | MOD_WIN, DefaultKey = 0x54;                   // Ctrl+Win+T — закрепить/открепить
+    public const int DefaultUnpinMods = MOD_CONTROL | MOD_SHIFT | MOD_WIN, DefaultUnpinKey = 0x54; // Ctrl+Shift+Win+T — открепить все
 
     [DllImport("user32.dll")] static extern int MapVirtualKey(int code, int mapType);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetKeyNameText(int lParam, StringBuilder sb, int n);
@@ -133,6 +134,8 @@ sealed class Settings
     public string Language = "auto";
     public int Modifiers = Hotkey.DefaultMods;
     public int Key = Hotkey.DefaultKey;
+    public int UnpinModifiers = Hotkey.DefaultUnpinMods; // «Открепить все»; UnpinKey = 0 — сочетание отключено
+    public int UnpinKey = Hotkey.DefaultUnpinKey;
 
     static string FilePath
     {
@@ -154,6 +157,11 @@ sealed class Settings
                     int m, vk;
                     if (k == "Language") s.Language = v;
                     else if (k == "Hotkey" && Hotkey.TryParse(v, out m, out vk)) { s.Modifiers = m; s.Key = vk; }
+                    else if (k == "UnpinAllHotkey")
+                    {
+                        if (string.Equals(v, "None", StringComparison.OrdinalIgnoreCase)) { s.UnpinModifiers = 0; s.UnpinKey = 0; }
+                        else if (Hotkey.TryParse(v, out m, out vk)) { s.UnpinModifiers = m; s.UnpinKey = vk; }
+                    }
                 }
         }
         catch (Exception ex) { Log.Info("Settings load failed: " + ex.Message); }
@@ -165,7 +173,8 @@ sealed class Settings
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
-            File.WriteAllText(FilePath, "Language=" + Language + "\r\nHotkey=" + Hotkey.Serialize(Modifiers, Key) + "\r\n", new UTF8Encoding(false));
+            File.WriteAllText(FilePath, "Language=" + Language + "\r\nHotkey=" + Hotkey.Serialize(Modifiers, Key)
+                + "\r\nUnpinAllHotkey=" + (UnpinKey == 0 ? "None" : Hotkey.Serialize(UnpinModifiers, UnpinKey)) + "\r\n", new UTF8Encoding(false));
         }
         catch (Exception ex) { Log.Info("Settings save failed: " + ex.Message); }
     }

@@ -512,12 +512,68 @@ sealed class BorderOverlay : IDisposable
     }
 }
 
+// «Запускать вместе с Windows» для портативного exe: запись в HKCU\...\Run на текущее место exe.
+// Install.ps1 вдобавок кладёт ярлык в папку «Автозагрузка» — при выключении убираем и его.
+// Отключение в диспетчере задач (StartupApproved) считаем выключенным автозапуском.
+static class Autostart
+{
+    const string Name = "AlwaysOnTop";
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\";
+
+    static string Shortcut { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), Name + ".lnk"); } }
+    static string InstalledExe { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), Name, Name + ".exe"); } }
+
+    // Диспетчер задач хранит «отключено» отдельно: первый байт нечётный (03) — выключено, чётный (02) — включено
+    static bool DisabledInTaskManager(string kind, string name)
+    {
+        using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ApprovedKey + kind))
+        {
+            var b = k == null ? null : k.GetValue(name) as byte[];
+            return b != null && b.Length > 0 && (b[0] & 1) != 0;
+        }
+    }
+
+    public static bool IsOn()
+    {
+        try
+        {
+            string exe = Native.ExePath();
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
+            {
+                string v = k == null ? null : k.GetValue(Name) as string;
+                if (v != null && v.IndexOf(exe, StringComparison.OrdinalIgnoreCase) >= 0 && !DisabledInTaskManager("Run", Name)) return true;
+            }
+            return File.Exists(Shortcut) && string.Equals(exe, InstalledExe, StringComparison.OrdinalIgnoreCase)
+                && !DisabledInTaskManager("StartupFolder", Name + ".lnk");
+        }
+        catch (Exception ex) { Log.Info("Autostart check failed: " + ex.Message); return false; }
+    }
+
+    public static void Set(bool on)
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (on) k.SetValue(Name, "\"" + Native.ExePath() + "\" --autostart");
+                else k.DeleteValue(Name, false);
+            }
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ApprovedKey + "Run", true))
+                if (k != null) k.DeleteValue(Name, false); // снять «отключено» диспетчера задач, если было
+            if (!on && File.Exists(Shortcut)) File.Delete(Shortcut);
+            Log.Info("Autostart " + (on ? "on: " + Native.ExePath() : "off"));
+        }
+        catch (Exception ex) { Log.Info("Autostart change failed: " + ex.Message); }
+    }
+}
+
 // Основной процесс: скрытое окно, хоткей, трей, закрепление. Свой цикл сообщений, без WinForms.
 sealed class App
 {
     public static readonly string WindowClass = Program.Id + "_Main";
     public const uint WM_APP_SETTINGS = 0x8002; // WM_APP + 2: повторный запуск exe просит открыть настройки
-    const int HOTKEY_ID = 1;
+    const int PIN_HOTKEY_ID = 1, UNPIN_HOTKEY_ID = 2;
     const uint WM_DESTROY = 0x0002, WM_ENDSESSION = 0x0016, WM_HOTKEY = 0x0312, WM_TIMER = 0x0113, WM_QUIT = 0x0012;
     const uint WM_CONTEXTMENU = 0x007B, WM_RBUTTONUP = 0x0205, WM_LBUTTONDBLCLK = 0x0203;
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_OBJECT_DESTROY = 0x8001, EVENT_OBJECT_HIDE = 0x8003, EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
@@ -534,7 +590,7 @@ sealed class App
     TrayIcon tray;
     IntPtr hwnd, foregroundHook, child;
     uint childPid, taskbarCreated;
-    bool hotkeyOk, timerOn, stopped;
+    bool pinOk, unpinOk, timerOn, stopped;
     int trayCount = -1;
 
     // Повторный запуск: находим окно работающей копии и просим открыть настройки
@@ -565,13 +621,14 @@ sealed class App
 
         tray = new TrayIcon(hwnd);
         UpdateTray();
-        hotkeyOk = RegisterHotkey(); // NOREPEAT: удержание клавиш не щёлкает pin/unpin по кругу
-        if (hotkeyOk) Log.Info("Started, hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + " registered, language " + Loc.Code);
+        RegisterHotkeys();
+        if (pinOk) Log.Info("Started, hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + " registered, language " + Loc.Code);
         else
         {
             Log.Info("RegisterHotKey FAILED " + Hotkey.Serialize(settings.Modifiers, settings.Key));
             OpenSettings(true); // окно настроек само сообщит, что сочетание занято
         }
+        if (pinOk) ReportUnpinHotkey(); // необязательное «Открепить все»: если занято — только уведомление
         Native.TrimMemory();
         Loop();
         Stop();
@@ -613,7 +670,10 @@ sealed class App
     {
         switch (msg)
         {
-            case WM_HOTKEY: if (w.ToInt32() == HOTKEY_ID) ToggleForeground(); return true;
+            case WM_HOTKEY:
+                if (w.ToInt32() == PIN_HOTKEY_ID) ToggleForeground();
+                else if (w.ToInt32() == UNPIN_HOTKEY_ID) { Log.Info("Unpin all by hotkey (" + pinned.Count + ")"); UnpinAll(); }
+                return true;
             case WM_TIMER: RefreshBorders(); return true;
             case TrayIcon.CallbackMessage: OnTray(w, l); return true;
             case WM_APP_SETTINGS: OpenSettings(false); return true;
@@ -633,10 +693,16 @@ sealed class App
         int x, y;
         if (tray.Version4) { x = (short)(w.ToInt64() & 0xFFFF); y = (short)((w.ToInt64() >> 16) & 0xFFFF); }
         else TrayIcon.CursorPos(out x, out y);
-        int cmd = tray.ShowMenu(x, y, new[] { Loc.T("Menu.Settings"), Loc.T("Menu.UnpinAll"), null, Loc.T("Menu.Exit") }, Loc.IsRtl);
+        // Сочетание «Открепить все» — справа в пункте меню, как подсказка клавиш в обычных программах
+        string unpinAll = Loc.T("Menu.UnpinAll") + (settings.UnpinKey != 0 ? "\t" + Hotkey.Format(settings.UnpinModifiers, settings.UnpinKey) : "");
+        bool autostart = Autostart.IsOn();
+        int cmd = tray.ShowMenu(x, y,
+            new[] { Loc.T("Menu.Settings"), Loc.T("Menu.Autostart"), unpinAll, null, Loc.T("Menu.Exit") },
+            new[] { false, autostart, false, false, false }, Loc.IsRtl);
         if (cmd == 1) OpenSettings(false);
-        else if (cmd == 2) UnpinAll();
-        else if (cmd == 4) { UnpinAll(); Native.DestroyWindow(hwnd); }
+        else if (cmd == 2) Autostart.Set(!autostart);
+        else if (cmd == 3) UnpinAll();
+        else if (cmd == 5) { UnpinAll(); Native.DestroyWindow(hwnd); }
     }
 
     static void WinEventStatic(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
@@ -660,7 +726,28 @@ sealed class App
         o.Sync(); // перемещение, ресайз, показ/скрытие
     }
 
-    bool RegisterHotkey() { return Native.RegisterHotKey(hwnd, HOTKEY_ID, settings.Modifiers | Hotkey.MOD_NOREPEAT, settings.Key); }
+    // NOREPEAT: удержание клавиш не щёлкает pin/unpin по кругу
+    void RegisterHotkeys()
+    {
+        pinOk = Native.RegisterHotKey(hwnd, PIN_HOTKEY_ID, settings.Modifiers | Hotkey.MOD_NOREPEAT, settings.Key);
+        unpinOk = settings.UnpinKey != 0
+            && Native.RegisterHotKey(hwnd, UNPIN_HOTKEY_ID, settings.UnpinModifiers | Hotkey.MOD_NOREPEAT, settings.UnpinKey);
+    }
+
+    void UnregisterHotkeys()
+    {
+        if (pinOk) Native.UnregisterHotKey(hwnd, PIN_HOTKEY_ID);
+        if (unpinOk) Native.UnregisterHotKey(hwnd, UNPIN_HOTKEY_ID);
+        pinOk = unpinOk = false;
+    }
+
+    void ReportUnpinHotkey()
+    {
+        if (settings.UnpinKey == 0 || unpinOk) return;
+        string combo = Hotkey.Format(settings.UnpinModifiers, settings.UnpinKey);
+        Log.Info("RegisterHotKey FAILED (unpin all) " + Hotkey.Serialize(settings.UnpinModifiers, settings.UnpinKey));
+        tray.Balloon("Always on Top", Loc.T("Err.HotkeyRegister", combo), true);
+    }
 
     string Title(IntPtr h)
     {
@@ -783,8 +870,8 @@ sealed class App
     void OpenSettings(bool hotkeyBusy)
     {
         if (child != IntPtr.Zero) { FocusChild(); return; }
-        // Пока окно открыто, хоткей снят: иначе нажатие текущего сочетания сработало бы как команда, а не как ввод
-        if (hotkeyOk) { Native.UnregisterHotKey(hwnd, HOTKEY_ID); hotkeyOk = false; }
+        // Пока окно открыто, хоткеи сняты: иначе нажатие текущего сочетания сработало бы как команда, а не как ввод
+        UnregisterHotkeys();
         var cmd = new StringBuilder("\"" + Native.ExePath() + "\" --settings" + (hotkeyBusy ? " --hotkey-busy" : ""));
         var si = new Native.STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(Native.STARTUPINFO));
@@ -793,7 +880,7 @@ sealed class App
         if (!Native.CreateProcess(null, cmd, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref si, out pi))
         {
             Log.Info("Settings process FAILED " + Marshal.GetLastWin32Error());
-            hotkeyOk = RegisterHotkey();
+            RegisterHotkeys();
             return;
         }
         Native.CloseHandle(pi.hThread);
@@ -820,9 +907,10 @@ sealed class App
         Native.CloseHandle(child);
         child = IntPtr.Zero;
         if (code == 0) { settings = Settings.Load(); Loc.Init(settings.Language); } // 0 — сохранили, иначе всё как было
-        hotkeyOk = RegisterHotkey();
-        if (!hotkeyOk)
+        RegisterHotkeys();
+        if (!pinOk)
             tray.Balloon("Always on Top", Loc.T("Err.HotkeyRegister", Hotkey.Format(settings.Modifiers, settings.Key)), true);
+        else ReportUnpinHotkey();
         trayCount = -1; // пересобрать подсказку: могли поменяться язык и сочетание
         UpdateTray();
     }
@@ -833,7 +921,7 @@ sealed class App
         stopped = true;
         StopTimer();
         foreach (var k in new List<IntPtr>(pinned.Keys)) Release(k);
-        if (hotkeyOk) Native.UnregisterHotKey(hwnd, HOTKEY_ID);
+        UnregisterHotkeys();
         if (tray != null) tray.Dispose(); // иначе значок «призраком» висит в трее до наведения мыши
         if (child != IntPtr.Zero) { Native.CloseHandle(child); child = IntPtr.Zero; }
     }
