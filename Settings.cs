@@ -136,11 +136,22 @@ sealed class Settings
     public int Key = Hotkey.DefaultKey;
     public int UnpinModifiers = Hotkey.DefaultUnpinMods; // «Открепить все»; UnpinKey = 0 — сочетание отключено
     public int UnpinKey = Hotkey.DefaultUnpinKey;
+    public bool Notifications = true; // уведомления «закреплено/откреплено»; сообщения об ошибках показываются всегда
+    public bool MiddleClickPin = true; // щелчок колёсиком по заголовку окна закрепляет/открепляет его
+    public bool Sound = true;          // короткий щелчок при закреплении и откреплении
+
+    static bool IsOff(string v)
+    {
+        return string.Equals(v, "Off", StringComparison.OrdinalIgnoreCase) || string.Equals(v, "false", StringComparison.OrdinalIgnoreCase) || v == "0";
+    }
 
     static string FilePath
     {
         get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AlwaysOnTop", "settings.ini"); }
     }
+
+    // Папка настроек — там же лежит список закреплённых окон (pinned.txt)
+    public static string Dir { get { return Path.GetDirectoryName(FilePath); } }
 
     public static Settings Load()
     {
@@ -162,6 +173,9 @@ sealed class Settings
                         if (string.Equals(v, "None", StringComparison.OrdinalIgnoreCase)) { s.UnpinModifiers = 0; s.UnpinKey = 0; }
                         else if (Hotkey.TryParse(v, out m, out vk)) { s.UnpinModifiers = m; s.UnpinKey = vk; }
                     }
+                    else if (k == "Notifications") s.Notifications = !IsOff(v);
+                    else if (k == "MiddleClickPin") s.MiddleClickPin = !IsOff(v);
+                    else if (k == "Sound") s.Sound = !IsOff(v);
                 }
         }
         catch (Exception ex) { Log.Info("Settings load failed: " + ex.Message); }
@@ -174,7 +188,10 @@ sealed class Settings
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
             File.WriteAllText(FilePath, "Language=" + Language + "\r\nHotkey=" + Hotkey.Serialize(Modifiers, Key)
-                + "\r\nUnpinAllHotkey=" + (UnpinKey == 0 ? "None" : Hotkey.Serialize(UnpinModifiers, UnpinKey)) + "\r\n", new UTF8Encoding(false));
+                + "\r\nUnpinAllHotkey=" + (UnpinKey == 0 ? "None" : Hotkey.Serialize(UnpinModifiers, UnpinKey))
+                + "\r\nNotifications=" + (Notifications ? "On" : "Off")
+                + "\r\nMiddleClickPin=" + (MiddleClickPin ? "On" : "Off")
+                + "\r\nSound=" + (Sound ? "On" : "Off") + "\r\n", new UTF8Encoding(false));
         }
         catch (Exception ex) { Log.Info("Settings save failed: " + ex.Message); }
     }

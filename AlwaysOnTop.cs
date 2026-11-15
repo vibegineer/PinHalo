@@ -71,7 +71,7 @@ static class Native
 {
     public const int GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x00000008, WS_EX_TOOLWINDOW = 0x80;
     public const uint WS_POPUP = 0x80000000;
-    public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_ASYNCWINDOWPOS = 0x4000;
     public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
     public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
 
@@ -166,6 +166,15 @@ static class Native
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    // --- мышь: щелчок колёсиком по заголовку (Raw Input не задерживает мышь, в отличие от перехвата WH_MOUSE_LL) ---
+    [StructLayout(LayoutKind.Sequential)] public struct RAWINPUTDEVICE { public ushort usUsagePage, usUsage; public uint dwFlags; public IntPtr hwndTarget; }
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+    [DllImport("user32.dll")] public static extern uint GetRawInputData(IntPtr hRaw, uint cmd, IntPtr data, ref uint size, uint headerSize);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint ms, out IntPtr result);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFO mi);
     [DllImport("user32.dll", SetLastError = true)]
@@ -190,6 +199,7 @@ static class Native
     [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h, out uint code);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentProcessId();
     [DllImport("kernel32.dll")] static extern bool SetProcessWorkingSetSize(IntPtr h, IntPtr min, IntPtr max);
 
     // В простое отдаём системе неиспользуемые страницы (JIT и старт); при следующем действии подтянутся сами
@@ -515,6 +525,63 @@ sealed class BorderOverlay : IDisposable
 // «Запускать вместе с Windows» для портативного exe: запись в HKCU\...\Run на текущее место exe.
 // Install.ps1 вдобавок кладёт ярлык в папку «Автозагрузка» — при выключении убираем и его.
 // Отключение в диспетчере задач (StartupApproved) считаем выключенным автозапуском.
+// Звук при закреплении/откреплении: короткий щелчок с тихим тоном, синтезируется в памяти — звуковых файлов в exe нет.
+// Щелчок — затухающий шум 12 мс и тон 2,6 кГц (у открепления 1,8 кГц); через 4 мс тон 1760 Гц (закрепить) или 1175 Гц (открепить), 90 мс.
+static class Chime
+{
+    [DllImport("winmm.dll")] static extern bool PlaySound(IntPtr sound, IntPtr hmod, uint flags);
+    const uint SND_ASYNC = 0x1, SND_NODEFAULT = 0x2, SND_MEMORY = 0x4;
+    static IntPtr pinWav, unpinWav; // неуправляемая память: с SND_ASYNC звук читается уже после возврата из PlaySound
+
+    public static void Play(bool pin)
+    {
+        try
+        {
+            IntPtr w = pin ? pinWav : unpinWav;
+            if (w == IntPtr.Zero) { w = Build(pin ? 2600 : 1800, pin ? 1760 : 1175); if (pin) pinWav = w; else unpinWav = w; }
+            if (!PlaySound(w, IntPtr.Zero, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) Log.Info("Sound FAILED");
+        }
+        catch (Exception ex) { Log.Info("Sound FAILED: " + ex.Message); }
+    }
+
+    static IntPtr Build(double clickHz, double toneHz)
+    {
+        const int sr = 44100;
+        int n = (int)(sr * 0.094), clickN = (int)(sr * 0.012), toneAt = (int)(sr * 0.004), toneN = (int)(sr * 0.09);
+        var s = new double[n];
+        var rnd = new Random(7);
+        for (int i = 0; i < clickN; i++)
+        {
+            double t = (double)i / sr;
+            double g = Math.Sqrt(-2 * Math.Log(1 - rnd.NextDouble())) * Math.Cos(2 * Math.PI * rnd.NextDouble()); // нормальный шум
+            s[i] += 0.6 * g * Math.Exp(-t / 0.002) + Math.Sin(2 * Math.PI * clickHz * t) * Math.Exp(-t / 0.004);
+        }
+        for (int i = 0; i < toneN && toneAt + i < n; i++)
+        {
+            double t = (double)i / sr, e = Math.Min(1, t / 0.004) * Math.Exp(-t / 0.025);
+            s[toneAt + i] += e * (Math.Sin(2 * Math.PI * toneHz * t) + 0.1 * Math.Sin(4 * Math.PI * toneHz * t));
+        }
+        double mean = 0, peak = 1e-9;
+        foreach (double v in s) mean += v;
+        mean /= n;
+        int fade = sr / 100;
+        for (int i = 0; i < n; i++) { s[i] -= mean; if (i >= n - fade) s[i] *= (double)(n - i) / fade; peak = Math.Max(peak, Math.Abs(s[i])); }
+
+        int data = n * 2; // WAV: заголовок RIFF 44 байта + 16-битный моно PCM, пик около −7 дБ
+        var b = new byte[44 + data];
+        Put(b, 0, "RIFF"); Put(b, 4, 36 + data, 4); Put(b, 8, "WAVE"); Put(b, 12, "fmt "); Put(b, 16, 16, 4);
+        Put(b, 20, 1, 2); Put(b, 22, 1, 2); Put(b, 24, sr, 4); Put(b, 28, sr * 2, 4); Put(b, 32, 2, 2); Put(b, 34, 16, 2);
+        Put(b, 36, "data"); Put(b, 40, data, 4);
+        for (int i = 0; i < n; i++) Put(b, 44 + 2 * i, (int)Math.Round(s[i] / peak * 0.45 * 32767), 2);
+        IntPtr p = Marshal.AllocHGlobal(b.Length);
+        Marshal.Copy(b, 0, p, b.Length);
+        return p;
+    }
+
+    static void Put(byte[] b, int at, string tag) { for (int i = 0; i < 4; i++) b[at + i] = (byte)tag[i]; }
+    static void Put(byte[] b, int at, int v, int size) { for (int i = 0; i < size; i++) b[at + i] = (byte)(v >> (8 * i)); }
+}
+
 static class Autostart
 {
     const string Name = "AlwaysOnTop";
@@ -579,18 +646,24 @@ sealed class App
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_OBJECT_DESTROY = 0x8001, EVENT_OBJECT_HIDE = 0x8003, EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
     const uint WINEVENT_OUTOFCONTEXT = 0, WINEVENT_SKIPOWNPROCESS = 2;
     const int OBJID_WINDOW = 0;
-    static readonly UIntPtr TimerId = new UIntPtr(1);
+    const uint WM_INPUT = 0x00FF, WM_NCHITTEST = 0x0084, RID_INPUT = 0x10000003, RIDEV_REMOVE = 0x1, RIDEV_INPUTSINK = 0x100;
+    const int RIM_TYPEMOUSE = 0, RI_MOUSE_MIDDLE_BUTTON_DOWN = 0x0010, HTCAPTION = 2, HTTRANSPARENT = -1;
+    const uint GA_ROOT = 2, SMTO_ABORTIFHUNG = 0x2;
+    static readonly UIntPtr TimerId = new UIntPtr(1), RetryTimerId = new UIntPtr(2);
 
     static Native.WndProc wndProc;           // поля: делегаты не должны собраться GC, пока ими пользуется Windows
     static Native.WinEventProc winEventProc;
     static App current;
 
     readonly Dictionary<IntPtr, BorderOverlay> pinned = new Dictionary<IntPtr, BorderOverlay>();
+    readonly List<IntPtr> unpinPending = new List<IntPtr>(); // открепление ещё не прошло — повторяем по таймеру RetryTimerId
+    int unpinTries;
     Settings settings;
     TrayIcon tray;
     IntPtr hwnd, foregroundHook, child;
+    IntPtr rawBuf;                           // один буфер на все сообщения WM_INPUT: при движении мыши они идут сотнями в секунду
     uint childPid, taskbarCreated;
-    bool pinOk, unpinOk, timerOn, stopped;
+    bool pinOk, unpinOk, timerOn, stopped, middleOn;
     int trayCount = -1;
 
     // Повторный запуск: находим окно работающей копии и просим открыть настройки
@@ -622,6 +695,8 @@ sealed class App
         tray = new TrayIcon(hwnd);
         UpdateTray();
         RegisterHotkeys();
+        UpdateMiddleClick();
+        AdoptOrphans();
         if (pinOk) Log.Info("Started, hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key) + " registered, language " + Loc.Code);
         else
         {
@@ -672,9 +747,10 @@ sealed class App
         {
             case WM_HOTKEY:
                 if (w.ToInt32() == PIN_HOTKEY_ID) ToggleForeground();
-                else if (w.ToInt32() == UNPIN_HOTKEY_ID) { Log.Info("Unpin all by hotkey (" + pinned.Count + ")"); UnpinAll(); }
+                else if (w.ToInt32() == UNPIN_HOTKEY_ID) { Log.Info("Unpin all by hotkey (" + pinned.Count + ")"); UnpinAllWithSound(); }
                 return true;
-            case WM_TIMER: RefreshBorders(); return true;
+            case WM_TIMER: if (w.ToInt64() == (long)RetryTimerId.ToUInt64()) RetryUnpins(); else RefreshBorders(); return true;
+            case WM_INPUT: OnRawInput(l); return false; // false: DefWindowProc должен освободить данные Raw Input
             case TrayIcon.CallbackMessage: OnTray(w, l); return true;
             case WM_APP_SETTINGS: OpenSettings(false); return true;
             case WM_ENDSESSION: if (w != IntPtr.Zero) Stop(); return true;
@@ -701,7 +777,7 @@ sealed class App
             new[] { false, autostart, false, false, false }, Loc.IsRtl);
         if (cmd == 1) OpenSettings(false);
         else if (cmd == 2) Autostart.Set(!autostart);
-        else if (cmd == 3) UnpinAll();
+        else if (cmd == 3) UnpinAllWithSound();
         else if (cmd == 5) { UnpinAll(); Native.DestroyWindow(hwnd); }
     }
 
@@ -763,17 +839,89 @@ sealed class App
             || c == "NotifyIconOverflowWindow" || c == "TopLevelWindowForOverflowXamlIsland";
     }
 
-    void ToggleForeground()
+    void ToggleForeground() { Toggle(Native.GetForegroundWindow(), ""); }
+
+    // via — пометка для лога: как закрепили (пусто — хоткеем)
+    void Toggle(IntPtr h, string via)
     {
-        IntPtr h = Native.GetForegroundWindow();
         if (h == IntPtr.Zero || h == hwnd) return;
         if (!Native.IsWindow(h) || IsShellWindow(h)) return;
         foreach (var ov in pinned.Values) if (ov.Handle == h) return; // свою рамку не трогаем
 
-        if (pinned.ContainsKey(h)) { Unpin(h); tray.Balloon("Always on Top", Loc.T("Toast.Unpinned", Title(h)), false); Log.Info("Unpin " + h); }
-        else if (Pin(h)) { tray.Balloon("Always on Top", Loc.T("Toast.Pinned", Title(h)), false); Log.Info("Pin " + h + " rect=" + Native.GetFrameBounds(h)); }
-        else { tray.Balloon("Always on Top", Loc.T("Toast.PinFailed", Title(h)), true); Log.Info("Pin FAILED " + h); }
+        // Уведомления «закреплено/откреплено» можно выключить в настройках; об ошибке сообщаем всегда — иначе неудача была бы немой
+        bool toast = settings.Notifications;
+        string quiet = toast ? "" : " (no toast)";
+        if (pinned.ContainsKey(h))
+        {
+            Unpin(h);
+            Sound(false);
+            if (toast) tray.Balloon("Always on Top", Loc.T("Toast.Unpinned", Title(h)), false);
+            Log.Info("Unpin " + h + via + quiet);
+        }
+        else if (Pin(h))
+        {
+            Sound(true);
+            if (toast) tray.Balloon("Always on Top", Loc.T("Toast.Pinned", Title(h)), false);
+            Log.Info("Pin " + h + " rect=" + Native.GetFrameBounds(h) + via + quiet);
+        }
+        else { tray.Balloon("Always on Top", Loc.T("Toast.PinFailed", Title(h)), true); Log.Info("Pin FAILED " + h + via); }
         UpdateTray();
+    }
+
+    // Щелчок колёсиком по заголовку. Raw Input с RIDEV_INPUTSINK приносит события мыши фоновому окну, ничего не перехватывая
+    // и не задерживая: щелчок как обычно доходит до программы под курсором. Включается настройкой MiddleClickPin.
+    void UpdateMiddleClick()
+    {
+        bool want = settings.MiddleClickPin && !stopped;
+        if (want == middleOn) return;
+        var d = new[] { new Native.RAWINPUTDEVICE { usUsagePage = 1, usUsage = 2, // Generic Desktop / Mouse
+                                                    dwFlags = want ? RIDEV_INPUTSINK : RIDEV_REMOVE, hwndTarget = want ? hwnd : IntPtr.Zero } };
+        if (Native.RegisterRawInputDevices(d, 1, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE))))
+        {
+            middleOn = want;
+            if (want && rawBuf == IntPtr.Zero) rawBuf = Marshal.AllocHGlobal(64);
+            Log.Info("Middle-click pinning " + (want ? "on" : "off"));
+        }
+        else Log.Info("RegisterRawInputDevices FAILED " + Marshal.GetLastWin32Error());
+    }
+
+    void OnRawInput(IntPtr hRaw)
+    {
+        if (!middleOn) return;
+        uint size = 64, hdr = (uint)(8 + 2 * IntPtr.Size);                 // RAWINPUTHEADER: dwType, dwSize, hDevice, wParam
+        if (Native.GetRawInputData(hRaw, RID_INPUT, rawBuf, ref size, hdr) == uint.MaxValue) return;
+        if (Marshal.ReadInt32(rawBuf, 0) != RIM_TYPEMOUSE) return;
+        int buttons = (ushort)Marshal.ReadInt16(rawBuf, (int)hdr + 4);   // RAWMOUSE.usButtonFlags
+        if ((buttons & RI_MOUSE_MIDDLE_BUTTON_DOWN) == 0) return;         // движения и другие кнопки — сразу мимо
+        Native.POINT p;
+        if (!Native.GetCursorPos(out p)) return;
+        IntPtr h = CaptionWindowAt(p);
+        if (h != IntPtr.Zero) Toggle(h, " (middle click)");
+    }
+
+    // Окно, чей заголовок под точкой, или Zero. Спрашиваем само окно (WM_NCHITTEST): так работают и свои заголовки
+    // (Chrome, Electron, WinUI) — там, где окно можно тащить, они отвечают HTCAPTION. Щелчок внутри окна (HTCLIENT) не трогаем.
+    IntPtr CaptionWindowAt(Native.POINT p)
+    {
+        IntPtr lp = new IntPtr((p.Y << 16) | (p.X & 0xFFFF));
+        IntPtr w = Native.WindowFromPoint(p);
+        for (int i = 0; w != IntPtr.Zero && i < 8; i++)
+        {
+            IntPtr res;
+            if (Native.SendMessageTimeout(w, WM_NCHITTEST, IntPtr.Zero, lp, SMTO_ABORTIFHUNG, 150, out res) == IntPtr.Zero)
+                return IntPtr.Zero;                                          // окно зависло или не отвечает нам (UIPI)
+            int ht = (int)res.ToInt64();
+            if (ht == HTCAPTION)
+            {
+                IntPtr root = Native.GetAncestor(w, GA_ROOT);
+                uint pid;
+                Native.GetWindowThreadProcessId(root, out pid);
+                return pid == Native.GetCurrentProcessId() ? IntPtr.Zero : root;
+            }
+            if (ht != HTTRANSPARENT) return IntPtr.Zero;
+            w = Native.GetParent(w);                                         // прозрачная для мыши часть — спрашиваем того, кто под ней
+        }
+        return IntPtr.Zero;
     }
 
     bool Pin(IntPtr h)
@@ -794,7 +942,53 @@ sealed class App
         pinned[h] = ov;
         ov.Sync();
         StartTimer();
+        SavePinned();
         return true;
+    }
+
+    // Список закреплённых окон на диске. Если программу закрыли не через «Выход» — убили, обновили, она упала —
+    // окна остаются поверх всех, и новая копия по этому списку снова находит их и возвращает рамку.
+    static string PinnedFile { get { return Path.Combine(Settings.Dir, "pinned.txt"); } }
+
+    void SavePinned()
+    {
+        try
+        {
+            if (pinned.Count == 0) { if (File.Exists(PinnedFile)) File.Delete(PinnedFile); return; }
+            var sb = new StringBuilder();
+            foreach (var h in pinned.Keys)
+            {
+                uint pid;
+                Native.GetWindowThreadProcessId(h, out pid);
+                sb.Append(h.ToInt64().ToString("X")).Append(' ').Append(pid).Append(' ').Append(Native.Text(h, true)).Append("\r\n"); // номер, процесс, класс — без заголовков
+            }
+            Directory.CreateDirectory(Settings.Dir);
+            File.WriteAllText(PinnedFile, sb.ToString());
+        }
+        catch (Exception ex) { Log.Info("Pinned list save failed: " + ex.Message); }
+    }
+
+    void AdoptOrphans()
+    {
+        string[] lines;
+        try { if (!File.Exists(PinnedFile)) return; lines = File.ReadAllLines(PinnedFile); }
+        catch (Exception ex) { Log.Info("Pinned list read failed: " + ex.Message); return; }
+        int n = 0;
+        foreach (string line in lines)
+        {
+            string[] p = line.Split(new[] { ' ' }, 3);
+            long hv; uint pid, realPid;
+            if (p.Length < 3 || !long.TryParse(p[0], System.Globalization.NumberStyles.HexNumber, null, out hv) || !uint.TryParse(p[1], out pid)) continue;
+            IntPtr h = new IntPtr(hv);
+            if (!Native.IsWindow(h)) continue;
+            Native.GetWindowThreadProcessId(h, out realPid);
+            if (realPid != pid || Native.Text(h, true) != p[2]) continue;                              // номер достался другому окну
+            if ((Native.GetWindowLong(h, Native.GWL_EXSTYLE) & Native.WS_EX_TOPMOST) == 0) continue;    // окно уже не поверх всех
+            if (Pin(h)) n++;
+        }
+        if (n > 0) Log.Info("Adopted " + n + " window(s) pinned before the restart");
+        SavePinned();
+        UpdateTray();
     }
 
     // Страховка на то, о чём событий нет (потеря topmost, «cloaked»): раз в секунду, Windows может сдвинуть его на 0,5 с,
@@ -830,12 +1024,52 @@ sealed class App
             if (!stopped) Native.TrimMemory(); // буфер рамки уже освобождён
         }
         UpdateTray();
+        SavePinned();
     }
 
     void Unpin(IntPtr h)
     {
-        Native.SetWindowPos(h, Native.HWND_NOTOPMOST, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
-        Release(h);
+        if (DropTopmost(h, false)) { Release(h); return; }
+        // Окно не сняло «поверх всех» сразу — так бывало у Chrome в момент щелчка по его заголовку. Рамку не убираем
+        // (она честно показывает, что окно ещё сверху) и повторяем попытку несколько раз с паузой.
+        Log.Info("Unpin: window " + h + " is still topmost, retrying");
+        if (!unpinPending.Contains(h)) unpinPending.Add(h);
+        unpinTries = 0;
+        Native.SetTimer(hwnd, RetryTimerId, 150, IntPtr.Zero);
+    }
+
+    // Снять «поверх всех»; true — получилось (или окна уже нет)
+    static bool DropTopmost(IntPtr h, bool async)
+    {
+        Native.SetWindowPos(h, Native.HWND_NOTOPMOST, 0, 0, 0, 0,
+            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | (async ? Native.SWP_ASYNCWINDOWPOS : 0));
+        return !Native.IsWindow(h) || (Native.GetWindowLong(h, Native.GWL_EXSTYLE) & Native.WS_EX_TOPMOST) == 0;
+    }
+
+    // Повторы открепления: каждые 150 мс, попеременно обычный и асинхронный вызов, до 3 секунд.
+    // Не вышло — окно остаётся закреплённым с рамкой: видно, что оно сверху, и можно открепить ещё раз.
+    void RetryUnpins()
+    {
+        unpinTries++;
+        foreach (var h in new List<IntPtr>(unpinPending))
+        {
+            if (!pinned.ContainsKey(h)) { unpinPending.Remove(h); continue; }  // окно уже закрыли
+            if (DropTopmost(h, unpinTries % 2 == 0)) { unpinPending.Remove(h); Release(h); Log.Info("Unpin " + h + " done on retry " + unpinTries); }
+        }
+        if (unpinPending.Count > 0 && unpinTries < 20) return;
+        Native.KillTimer(hwnd, RetryTimerId);
+        foreach (var h in unpinPending) Log.Info("Unpin FAILED " + h + ": the window keeps itself on top");
+        unpinPending.Clear();
+    }
+
+    void Sound(bool pin) { if (settings.Sound) Chime.Play(pin); }
+
+    // «Открепить все» хоткеем или из меню — со звуком; выход из программы открепляет молча
+    void UnpinAllWithSound()
+    {
+        if (pinned.Count == 0) return;
+        UnpinAll();
+        Sound(false);
     }
 
     void UnpinAll()
@@ -908,6 +1142,7 @@ sealed class App
         child = IntPtr.Zero;
         if (code == 0) { settings = Settings.Load(); Loc.Init(settings.Language); } // 0 — сохранили, иначе всё как было
         RegisterHotkeys();
+        UpdateMiddleClick();
         if (!pinOk)
             tray.Balloon("Always on Top", Loc.T("Err.HotkeyRegister", Hotkey.Format(settings.Modifiers, settings.Key)), true);
         else ReportUnpinHotkey();
@@ -920,8 +1155,17 @@ sealed class App
         if (stopped) return;
         stopped = true;
         StopTimer();
-        foreach (var k in new List<IntPtr>(pinned.Keys)) Release(k);
+        Native.KillTimer(hwnd, RetryTimerId);
+        unpinPending.Clear();
+        // Любой выход (не только «Выход» в меню: WM_CLOSE, завершение сеанса) снимает «поверх всех» с окон, которые закрепили мы, —
+        // иначе они остались бы поверх всех без рамки. Асинхронно: зависшее чужое окно не задержит выход.
+        foreach (var k in new List<IntPtr>(pinned.Keys))
+        {
+            Native.SetWindowPos(k, Native.HWND_NOTOPMOST, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
+            Release(k);
+        }
         UnregisterHotkeys();
+        UpdateMiddleClick(); // stopped == true — снимает Raw Input
         if (tray != null) tray.Dispose(); // иначе значок «призраком» висит в трее до наведения мыши
         if (child != IntPtr.Zero) { Native.CloseHandle(child); child = IntPtr.Zero; }
     }

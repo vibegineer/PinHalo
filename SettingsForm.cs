@@ -197,7 +197,7 @@ sealed class HotkeyField
     public void Dispose() { Capturing = false; Unhook(); }
 }
 
-// Окно настроек: два сочетания и язык. Раскладка считается вручную от DPI и размера шрифта, чтобы работать и при масштабе экрана > 100%.
+// Окно настроек: два сочетания, язык, щелчок колёсиком и уведомления. Раскладка считается вручную от DPI и размера шрифта, чтобы работать и при масштабе экрана > 100%.
 sealed class SettingsForm : Form
 {
     sealed class LangItem
@@ -212,6 +212,7 @@ sealed class SettingsForm : Form
     readonly Func<int, int, bool> canRegister;
     readonly HotkeyField pin, unpin;
     readonly ComboBox lang;
+    readonly CheckBox notify, middle, sound;
     readonly Label note;
     readonly Button save;
     readonly string hint;
@@ -221,6 +222,9 @@ sealed class SettingsForm : Form
     public int Key { get { return pin.Key; } }
     public int UnpinModifiers { get { return unpin.Modifiers; } }
     public int UnpinKey { get { return unpin.Key; } }
+    public bool Notifications { get { return notify.Checked; } }
+    public bool MiddleClickPin { get { return middle.Checked; } }
+    public bool Sound { get { return sound.Checked; } }
     public string Language { get; private set; }
 
     // Окно всегда строится на текущем языке Loc. Выбор другого языка закрывает окно с DialogResult.Retry,
@@ -228,7 +232,8 @@ sealed class SettingsForm : Form
     // разворачивает только при создании окна.
     // canRegister: свободно ли сочетание в системе.
     // location: где стояло прежнее окно при пересоздании (null — первое открытие, по центру экрана).
-    public SettingsForm(int mods, int key, int unpinMods, int unpinKey, string language, Icon icon, Func<int, int, bool> canRegister, Point? location)
+    public SettingsForm(int mods, int key, int unpinMods, int unpinKey, string language, bool notifications, bool middleClick, bool soundOn, Icon icon,
+                        Func<int, int, bool> canRegister, Point? location)
     {
         this.canRegister = canRegister;
         Language = language;
@@ -297,7 +302,23 @@ sealed class SettingsForm : Form
         lang.SetBounds(M, y, CW, fieldH);
         lang.SelectionChangeCommitted += OnLanguagePicked;
         Controls.Add(lang);
-        y += lang.Height + S(20);
+        y += lang.Height + S(14);
+
+        // Флажки: щелчок колёсиком по заголовку и уведомления. Текст может переноситься, поэтому высота — по тексту (флажок ~S(22) слева)
+        Func<string, bool, CheckBox> check = (text, on) =>
+        {
+            int h = Math.Max(line + S(4), TextRenderer.MeasureText(text, Font, new Size(CW - S(22), 0), flags).Height + S(4));
+            var c = new CheckBox { Text = text, Checked = on, AutoSize = false, UseVisualStyleBackColor = true,
+                                   CheckAlign = ContentAlignment.TopLeft, TextAlign = ContentAlignment.TopLeft };
+            c.SetBounds(M, y, CW, h);
+            Controls.Add(c);
+            y += h + S(6);
+            return c;
+        };
+        middle = check(Loc.T("Settings.MiddleClick"), middleClick);
+        notify = check(Loc.T("Settings.Notify"), notifications);
+        sound = check(Loc.T("Settings.Sound"), soundOn);
+        y += S(10);
 
         string saveText = Loc.T("Settings.Save"), cancelText = Loc.T("Settings.Cancel"), defText = Loc.T("Settings.Default");
         int bh = fieldH + S(4);
@@ -424,17 +445,18 @@ static class SettingsApp
         // Несохранённое состояние окна: переживает пересоздание окна при смене языка
         int mods = settings.Modifiers, key = settings.Key, umods = settings.UnpinModifiers, ukey = settings.UnpinKey;
         string lang = settings.Language;
+        bool notify = settings.Notifications, middle = settings.MiddleClickPin, sound = settings.Sound;
         Point? at = null;
         while (true)
         {
             Loc.Init(lang); // окно показывается на выбранном, но ещё не сохранённом языке
-            using (var f = new SettingsForm(mods, key, umods, ukey, lang, icon, CanRegister, at))
+            using (var f = new SettingsForm(mods, key, umods, ukey, lang, notify, middle, sound, icon, CanRegister, at))
             {
                 DialogResult r = f.ShowDialog();
                 if (r == DialogResult.Retry)
                 {
                     mods = f.Modifiers; key = f.Key; umods = f.UnpinModifiers; ukey = f.UnpinKey;
-                    lang = f.Language; at = f.Location;
+                    lang = f.Language; notify = f.Notifications; middle = f.MiddleClickPin; sound = f.Sound; at = f.Location;
                     continue;
                 }
                 if (r != DialogResult.OK) return 1;
@@ -443,10 +465,14 @@ static class SettingsApp
                 settings.Key = f.Key;
                 settings.UnpinModifiers = f.UnpinModifiers;
                 settings.UnpinKey = f.UnpinKey;
+                settings.Notifications = f.Notifications;
+                settings.MiddleClickPin = f.MiddleClickPin;
+                settings.Sound = f.Sound;
                 settings.Save();
                 Log.Info("Settings saved: hotkey " + Hotkey.Serialize(settings.Modifiers, settings.Key)
                     + ", unpin all " + (settings.UnpinKey == 0 ? "None" : Hotkey.Serialize(settings.UnpinModifiers, settings.UnpinKey))
-                    + ", language " + Loc.Code);
+                    + ", middle click " + (settings.MiddleClickPin ? "on" : "off")
+                    + ", notifications " + (settings.Notifications ? "on" : "off") + ", sound " + (settings.Sound ? "on" : "off") + ", language " + Loc.Code);
                 return 0;
             }
         }
